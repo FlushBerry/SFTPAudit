@@ -8,6 +8,8 @@ import logging
 import random
 import string
 import stat
+import subprocess
+import shutil
 
 # Désactivation des logs Paramiko
 logging.getLogger('paramiko').setLevel(logging.CRITICAL)
@@ -49,7 +51,7 @@ def parse_args():
     parser.add_argument('--port', type=int, default=22, help='Port SSH/SFTP')
     parser.add_argument('--user', required=True, help='Utilisateur SSH valide')
     parser.add_argument('--key', required=True, help='Clé privée SSH (chemin)')
-    parser.add_argument('--dir', default=DEFAULT_PAYLOAD_DIR, help='[OBSOLETE] Dossier par défaut pour anciens tests (compat)')
+    parser.add_argument('--dir', default=DEFAULT_PAYLOAD_DIR, help='[OBSOLETE] Dossier par défaut (compat)')
     parser.add_argument('--folder', default=None, help='Dossier distant à tester. Si absent: menu interactif; 0 = tous')
     parser.add_argument('--race-count', type=int, default=300, help="Nombre d'essais race condition")
     parser.add_argument('-p', '--sections', help='Numéros des sections à exécuter, ex: "1,2,10"')
@@ -96,14 +98,13 @@ def test_chroot(num, sftp):
         print(f"    [{G}+{C}] list('..') bloqué → chroot actif")
         return False
 
-# Section 3: Symlink (dans le dossier ciblé) + lecture via le lien si créé
+# Section 3: Symlink + lecture via le lien si créé
 def test_symlink(num, sftp, target, link_parent_dir):
     print(f"\n{COLORS['symlink']}--- Section {num}: {SECTION_DEFS[num-1][1]} ---{COLORS['end']}")
     linkname = join_remote(link_parent_dir, 'audit_symlink')
     try:
         sftp.symlink(target, linkname)
         print(f"    [{G}+{C}] Symlink créé: {linkname} -> {target}")
-        # Tente de lire via le lien symbolique
         try:
             with sftp.open(linkname, 'r') as f:
                 data = f.read(200)
@@ -111,7 +112,6 @@ def test_symlink(num, sftp, target, link_parent_dir):
             print(f"    [{G}+{C}] Lecture via symlink OK ({len(data)} bytes). Aperçu:\n------\n{preview}\n------")
         except Exception as e_read:
             print(f"    [{R}✗{C}] Lecture via symlink échouée : {e_read}")
-        # Supprime le lien
         sftp.remove(linkname)
         print(f"    [{G}+{C}] Symlink supprimé")
     except Exception as e:
@@ -128,7 +128,7 @@ def test_read(num, sftp, path):
     except Exception as e:
         print(f"    [{R}✗{C}] Échec lecture {path} : {e}")
 
-# Section 7: Écriture / Suppression (dans le dossier ciblé) + vérification contenu
+# Section 7: Écriture/Suppression (dans le dossier ciblé) + vérification contenu
 def test_write(num, sftp, target_dir):
     print(f"\n{COLORS['write']}--- Section {num}: {SECTION_DEFS[num-1][1]} ---{COLORS['end']}")
     path = join_remote(target_dir, 'sftp_test.txt')
@@ -136,11 +136,9 @@ def test_write(num, sftp, target_dir):
         with sftp.open(path, 'w') as f:
             f.write(TEST_PAYLOAD)
         print(f"    [{G}+{C}] Écriture OK : {path}")
-        # Vérifie le contenu
         with sftp.open(path, 'r') as f:
             content = f.read().decode(errors='replace')
         print(f"    [{G}+{C}] Contenu lu : {content!r}")
-        # Suppression
         sftp.remove(path)
         print(f"    [{G}+{C}] Suppression OK : {path}")
     except Exception as e:
@@ -168,16 +166,13 @@ def test_permissions(num, sftp, remote_dir):
         try:
             with sftp.open(path, 'w') as f:
                 f.write(TEST_PAYLOAD)
-            # Vérifie contenu
             with sftp.open(path, 'r') as f:
                 content = f.read().decode(errors='replace')
             print(f"    [{G}+{C}] {fname} écrit & lu : {content!r}")
-            # Test chmod/stat
             sftp.chmod(path, m)
             actual = sftp.stat(path).st_mode & 0o777
             mark = G+'+'+C if actual == m else R+'✗'+C
             print(f"    [{mark}] File {fname}: {oct(m)} --> {oct(actual)}")
-            # Cleanup
             sftp.remove(path)
         except Exception as e:
             print(f"    [{R}✗{C}] File {fname} test: {e}")
@@ -216,13 +211,37 @@ def test_proc(num, sftp):
     except Exception as e:
         print(f"    [{R}✗{C}] Échec /proc : {e}")
 
-# Section 12: ssh-audit
-def test_ssh_audit(num, host, port):
+# Section 12: ssh-audit (auto git clone si absent dans la racine du script)
+def test_ssh_audit(num, host, port, script_root):
     print(f"\n{COLORS['ssh_audit']}--- Section {num}: {SECTION_DEFS[num-1][1]} ---{COLORS['end']}")
-    if not os.path.exists('ssh-audit.py'):
-        print(f"    [{R}✗{C}] ssh-audit.py non présent")
-    else:
-        os.system(f"python3 ssh-audit.py {host}:{port}")
+    tool_dir = os.path.join(script_root, 'ssh-audit')
+    tool_py = os.path.join(tool_dir, 'ssh-audit.py')
+
+    if not os.path.isfile(tool_py):
+        print(f"    [!]{C} Outil ssh-audit introuvable à {tool_py}")
+        print(f"    [*]{C} Tentative de clonage: git clone https://github.com/jtesta/ssh-audit.git")
+        if shutil.which('git') is None:
+            print(f"    [{R}✗{C}] git n'est pas installé ou introuvable dans PATH.")
+            return
+        try:
+            result = subprocess.run(
+                ['git', 'clone', 'https://github.com/jtesta/ssh-audit.git', tool_dir],
+                capture_output=True, text=True
+            )
+            if result.returncode != 0:
+                print(f"    [{R}✗{C}] git clone a échoué: {result.stderr.strip() or result.stdout.strip()}")
+                return
+            print(f"    [{G}+{C}] Dépôt cloné dans {tool_dir}")
+        except Exception as e:
+            print(f"    [{R}✗{C}] Échec du clonage: {e}")
+            return
+
+    # Exécution de ssh-audit.py
+    try:
+        print(f"    [*]{C} Exécution: {tool_py} {host}:{port}")
+        subprocess.run([sys.executable, tool_py, f"{host}:{port}"])
+    except Exception as e:
+        print(f"    [{R}✗{C}] Exécution ssh-audit échouée: {e}")
 
 # Section 13: SSH Simple Commandes
 def test_ssh_simple(num, host, port, user, key_filename):
@@ -238,7 +257,7 @@ def test_ssh_simple(num, host, port, user, key_filename):
     except Exception as e:
         print(f"    [{R}✗{C}] SSH simple échec: {e}")
 
-# Section 14: Test Race Condition (inchangé)
+# Section 14: Test Race Condition
 def test_race_condition(num, host, port, valid_user, key_path, count):
     print(f"\n{COLORS['race']}--- Section {num}: {SECTION_DEFS[num-1][1]} ---{COLORS['end']}")
     vals = []
@@ -294,11 +313,6 @@ def is_link_attr(attr):
     return stat.S_ISLNK(attr.st_mode)
 
 def list_dirs_recursive(sftp, root, max_entries=10000):
-    """
-    Retourne la liste des dossiers sous 'root' (inclus), en DFS.
-    Évite les liens symboliques pour prévenir les boucles.
-    Limite molle via max_entries.
-    """
     dirs = []
     stack = [root]
     visited = set()
@@ -368,6 +382,8 @@ def choose_folder_interactive(sftp):
 def main(args):
     all_nums = {n for n, _ in SECTION_DEFS}
     selected = all_nums if not args.sections else {int(x) for x in args.sections.split(',') if x}
+    script_root = os.path.dirname(os.path.abspath(__file__))
+
     ssh_main = connect_ssh(args.host, args.port, args.user, key_filename=args.key)
     sftp = open_sftp(ssh_main)
 
@@ -377,7 +393,7 @@ def main(args):
     else:
         folders_to_test = choose_folder_interactive(sftp)
 
-    # Tâches "globales" (pas liées au dossier)
+    # Tâches globales
     global_tasks = [
         (1, test_banner, [1, ssh_main]),
         (2, test_chroot, [2, sftp]),
@@ -385,12 +401,12 @@ def main(args):
         (5, test_read, [5, sftp, '/etc/shadow']),
         (6, test_read, [6, sftp, '/var/log/auth.log']),
         (11, test_proc, [11, sftp]),
-        (12, test_ssh_audit, [12, args.host, args.port]),
+        (12, test_ssh_audit, [12, args.host, args.port, script_root]),
         (13, test_ssh_simple, [13, args.host, args.port, args.user, args.key]),
         (14, test_race_condition, [14, args.host, args.port, args.user, args.key, args.race_count]),
     ]
 
-    # Tâches "par dossier"
+    # Tâches par dossier
     per_folder_tasks = [
         (3, test_symlink),
         (7, test_write),
@@ -400,12 +416,10 @@ def main(args):
         (15, test_payload_upload)
     ]
 
-    # Exécution des tâches globales
     for num, func, fargs in global_tasks:
         if num in selected:
             func(*fargs)
 
-    # Exécution des tâches par dossier
     for folder in folders_to_test:
         print(f"\n{G}=== Tests dossier cible: {folder} ==={C}")
         for num, func in per_folder_tasks:
